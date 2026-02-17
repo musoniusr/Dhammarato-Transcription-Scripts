@@ -1,1 +1,4 @@
 .env
+failed_videos.txt
+*.bak
+.~lock.*

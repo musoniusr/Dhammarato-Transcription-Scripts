@@ -3,6 +3,7 @@ import requests
 import time
 import os
 import json
+import csv
 from datetime import datetime
 from pathlib import Path
 import re
@@ -12,20 +13,62 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / '.env')
 
 # Base paths
-base_path = r'C:\Users\docsu\Documents\Dhammarato\Dhammarato Diarized Transcript Files and Recordings'
-github_posts_path = r'G:\Work-Home Sync\Dhammarato.com\dhammarato-site\src\content\blog'
-video_urls_path = r'G:\Work-Home Sync\Dhammarato.com\Dhammarato Transcription Scripts\list_of_videos.txt'
+base_path = os.getenv("BASE_PATH")
+github_posts_path = os.getenv("GITHUB_POSTS_PATH")
+video_urls_path = os.getenv("VIDEO_URLS_PATH")
+manifest_csv_path = os.path.join(os.path.dirname(__file__), 'processed_videos.csv')
+
+
+def load_manifest():
+    """Load processed_videos.csv into sets of video IDs and filenames for fast dedup."""
+    video_ids = set()
+    filenames = set()
+    if os.path.exists(manifest_csv_path):
+        with open(manifest_csv_path, 'r', newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get('video_id'):
+                    video_ids.add(row['video_id'])
+                if row.get('filename'):
+                    filenames.add(row['filename'])
+    return video_ids, filenames
+
+
+def append_to_manifest(video_id, title, filename, pub_date, assemblyai_transcript_id=''):
+    """Append a single row to the CSV manifest after successfully processing a video."""
+    file_exists = os.path.exists(manifest_csv_path)
+    with open(manifest_csv_path, 'a', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=['video_id', 'title', 'filename', 'pub_date', 'assemblyai_transcript_id'])
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow({
+            'video_id': video_id,
+            'title': title,
+            'filename': filename,
+            'pub_date': pub_date,
+            'assemblyai_transcript_id': assemblyai_transcript_id,
+        })
 
 def extract_date_from_title(title):
-    date_pattern = r'(\d{2})[./-](\d{2})[./-](\d{2})'
-    match = re.search(date_pattern, title)
-
-    if match:
-        month, day, year = match.groups()  # MM.DD.YY format
+    # Try 4-digit year first: M(M) D(D) YYYY (dots, dashes, slashes, or spaces)
+    match_4yr = re.search(r'(\d{1,2})[./ -](\d{1,2})[./ -](\d{4})', title)
+    if match_4yr:
+        month, day, year = match_4yr.groups()
         try:
-            return datetime.strptime(f"{year}-{month}-{day}", "%y-%m-%d")
+            return datetime(int(year), int(month), int(day))
         except ValueError:
-            return None
+            pass
+
+    # Fallback: 2-digit year at end of title (with optional "mp4" suffix)
+    # Anchored to end to avoid matching episode numbers like "304 05 18"
+    match_2yr = re.search(r'(\d{1,2})[./ -](\d{1,2})[./ -](\d{2})\s*(?:mp4)?\s*$', title)
+    if match_2yr:
+        month, day, year = match_2yr.groups()
+        try:
+            return datetime.strptime(f"{int(year):02d}-{int(month):02d}-{int(day):02d}", "%y-%m-%d")
+        except ValueError:
+            pass
+
     return None
 
 def clean_title(title):
@@ -61,9 +104,14 @@ def create_github_front_matter(video_title, talk_date, upload_date, channel_name
     if tags is None:
         tags = ["transcripts"]
     tags_str = ", ".join(tags)
+    # Use single quotes for title if it contains double quotes, and escape any single quotes
+    if '"' in cleaned_title:
+        title_yaml = f"'{cleaned_title.replace(chr(39), chr(39)+chr(39))}'"
+    else:
+        title_yaml = f'"{cleaned_title}"'
     front_matter = f"""---
 layout: post
-title: "{cleaned_title}"
+title: {title_yaml}
 pubDate: {talk_date.strftime('%Y-%m-%d')}
 author: Dhammarato
 categories: [transcripts, Dhamma Talk]
@@ -107,8 +155,11 @@ def process_video(video_url):
         audio_file_path = os.path.join(base_path, existing_mp3s[0])
         print(f"Audio already exists, skipping download: {audio_file_path}")
     else:
-        # Download the audio file
-        subprocess.run(['yt-dlp', '--remote-components', 'ejs:github', '-x', '--audio-format', 'mp3', '--output', os.path.join(base_path, '%(title)s.%(ext)s'), video_url])
+        # Download the audio file (2 retries max, then move on)
+        result = subprocess.run(['yt-dlp', '--remote-components', 'ejs:github', '--retries', '2', '-x', '--audio-format', 'mp3', '--output', os.path.join(base_path, '%(title)s.%(ext)s'), video_url])
+        if result.returncode != 0:
+            print("Download failed, skipping video for now.")
+            return None
         # Get the most recently created .mp3 file
         audio_file_path = max(
             (os.path.join(base_path, f) for f in os.listdir(base_path) if f.endswith('.mp3')),
@@ -118,6 +169,34 @@ def process_video(video_url):
     # Path where the transcript files will be saved
     txt_transcript_file_path = os.path.join(base_path, f'{base_name}.txt')
     md_transcript_file_path = os.path.join(base_path, f'{base_name}.md')
+
+    # Check if transcript already exists (from a previous interrupted run)
+    if os.path.exists(md_transcript_file_path) and os.path.getsize(md_transcript_file_path) > 0:
+        print(f"Transcript already exists, skipping transcription: {md_transcript_file_path}")
+        # Extract assemblyai_transcript_id from existing file if present
+        existing_transcript_id = None
+        with open(md_transcript_file_path, 'r', encoding='utf-8') as f:
+            in_frontmatter = False
+            for fline in f:
+                stripped = fline.strip()
+                if stripped == '---' and not in_frontmatter:
+                    in_frontmatter = True
+                    continue
+                if stripped == '---' and in_frontmatter:
+                    break  # end of frontmatter
+                if in_frontmatter and stripped.startswith('assemblyai_transcript_id:'):
+                    existing_transcript_id = stripped.split(':', 1)[1].strip()
+                    break
+        return {
+            'title': video_title,
+            'talk_date': talk_date,
+            'upload_date': upload_date,
+            'channel_name': channel_name,
+            'video_id': video_info['id'],
+            'transcript_id': existing_transcript_id,
+            'transcript_path': md_transcript_file_path,
+            'base_name': base_name
+        }
 
     # Upload audio to AssemblyAI
     api_key = os.getenv("ASSEMBLYAI_API_KEY")
@@ -143,6 +222,8 @@ def process_video(video_url):
     polling_endpoint = base_api_url + "/v2/transcript/" + transcript_id
 
     # Poll for completion
+    transcription_start = time.time()
+    transcription_timeout = 15 * 60  # 15 minutes
     while True:
         result = requests.get(polling_endpoint, headers=headers).json()
         if result["status"] == "completed":
@@ -152,7 +233,11 @@ def process_video(video_url):
             print(f"Transcription failed: {result['error']}")
             return None
         else:
-            print(f"Transcription status: {result['status']}...")
+            elapsed = int(time.time() - transcription_start)
+            print(f"Transcription status: {result['status']}... ({elapsed}s)")
+            if elapsed > transcription_timeout:
+                print("Transcription timed out after 15 minutes, skipping video.")
+                return None
             time.sleep(5)
 
     # Get utterances for speaker diarization
@@ -299,15 +384,87 @@ Please put name, age, location and practice info when sending an e-mail
         f.write(ai_summary)
         f.write(sangha_info)
 
-# Process each YouTube video
+# Load manifest once at startup for fast dedup
+processed_video_ids, processed_filenames = load_manifest()
+print(f"Loaded manifest: {len(processed_video_ids)} video IDs, {len(processed_filenames)} filenames")
+
+print("Pulling latest manifest from git...")
+subprocess.run(['git', '-C', os.path.dirname(__file__), 'pull', '--rebase'], check=False)
+# Reload manifest after pull in case it was updated
+processed_video_ids, processed_filenames = load_manifest()
+
+
+def try_process_video(video_url):
+    """Attempt to process a single video URL. Returns True if processed/skipped, False if failed."""
+    # Extract video ID for deduplication check against manifest
+    video_id_match = re.search(r'[?&]v=([a-zA-Z0-9_-]{11})', video_url)
+    if video_id_match:
+        video_id = video_id_match.group(1)
+        if video_id in processed_video_ids:
+            print(f"  -> SKIP (video ID in manifest): {video_id}")
+            return True
+
+    print(f"Processing video: {video_url}")
+    video_info = process_video(video_url)
+    if video_info:
+        file_name = format_file_name(video_info['title'], video_info['talk_date'])
+
+        # Check filename-based dedup (catches re-uploads with different video IDs)
+        if file_name in processed_filenames:
+            print(f"  -> SKIP (filename already in manifest): {file_name}")
+            # Still record this video ID so future runs get the fast ID-based skip
+            if video_info['video_id'] not in processed_video_ids:
+                append_to_manifest(
+                    video_id=video_info['video_id'],
+                    title=video_info['title'],
+                    filename=file_name,
+                    pub_date=video_info['talk_date'].strftime('%Y-%m-%d'),
+                    assemblyai_transcript_id=video_info.get('transcript_id', ''),
+                )
+                processed_video_ids.add(video_info['video_id'])
+            return True
+
+        # Record in manifest immediately so interrupted runs don't re-transcribe
+        append_to_manifest(
+            video_id=video_info['video_id'],
+            title=video_info['title'],
+            filename=file_name,
+            pub_date=video_info['talk_date'].strftime('%Y-%m-%d'),
+            assemblyai_transcript_id=video_info.get('transcript_id', ''),
+        )
+        processed_video_ids.add(video_info['video_id'])
+        processed_filenames.add(file_name)
+
+        create_github_markdown(video_url, video_info.get('transcript_id'))
+        print(f"Completed processing video: {video_info['title']}")
+        return True
+    else:
+        print(f"Failed to process video: {video_url}")
+        return False
+
+
+failed_urls_path = os.path.join(os.path.dirname(__file__), 'failed_videos.txt')
+
+
+def record_failed(video_url):
+    """Append a failed URL to disk so it survives Ctrl+C."""
+    with open(failed_urls_path, 'a', encoding='utf-8') as f:
+        f.write(video_url + '\n')
+
+
+# Clear failed list from any previous run
+if os.path.exists(failed_urls_path):
+    os.remove(failed_urls_path)
+
+# Parse video URLs from input file
 with open(video_urls_path, 'r') as file:
     lines = file.read().splitlines()
 
+video_urls = []
 for line in lines:
     line = line.strip()
     if not line:
         continue
-    # Extract YouTube URL from pipe-delimited format or use as-is
     if '|' in line:
         # Format: NA | Title | Info | Date | URL
         parts = [p.strip() for p in line.split('|')]
@@ -317,29 +474,41 @@ for line in lines:
             continue
     else:
         video_url = line
+    video_urls.append(video_url)
 
-    # Extract video ID for deduplication check
-    video_id_match = re.search(r'[?&]v=([a-zA-Z0-9_-]{11})', video_url)
-    if video_id_match:
-        video_id = video_id_match.group(1)
-        print(f"Checking for duplicates: {video_id}...")
-        # Check if a blog post already contains this video ID (embedded in iframe or front matter)
-        existing = [f for f in os.listdir(github_posts_path) if f.endswith('.md')]
-        already_exists = False
-        for fname in existing:
-            fpath = os.path.join(github_posts_path, fname)
-            with open(fpath, 'r', encoding='utf-8') as check_f:
-                if video_id in check_f.read():
-                    print(f"  -> SKIP (already exists): {fname}")
-                    already_exists = True
-                    break
-        if already_exists:
-            continue
+# First pass
+failed_urls = []
+for video_url in video_urls:
+    if not try_process_video(video_url):
+        record_failed(video_url)
+        failed_urls.append(video_url)
 
-    print(f"Processing video: {video_url}")
-    video_info = process_video(video_url)
-    if video_info:
-        create_github_markdown(video_url, video_info.get('transcript_id'))
-        print(f"Completed processing video: {video_info['title']}")
+# Retry pass for failed videos
+if failed_urls:
+    print(f"\n{'='*60}")
+    print(f"Retrying {len(failed_urls)} failed video(s)...")
+    print(f"{'='*60}\n")
+    # Clear the file — we'll re-record anything that still fails
+    if os.path.exists(failed_urls_path):
+        os.remove(failed_urls_path)
+    for video_url in failed_urls:
+        if not try_process_video(video_url):
+            record_failed(video_url)
+
+    # Report final state
+    if os.path.exists(failed_urls_path):
+        with open(failed_urls_path, 'r') as f:
+            still_failed = [u.strip() for u in f if u.strip()]
+        print(f"\n{'='*60}")
+        print(f"{len(still_failed)} video(s) still failed. Saved to: {failed_urls_path}")
+        for url in still_failed:
+            print(f"  {url}")
+        print(f"{'='*60}")
     else:
-        print(f"Failed to process video: {video_url}")
+        print("All retried videos succeeded!")
+
+print("Committing and pushing updated manifest...")
+script_dir = os.path.dirname(__file__)
+subprocess.run(['git', '-C', script_dir, 'add', 'processed_videos.csv'], check=False)
+subprocess.run(['git', '-C', script_dir, 'commit', '-m', 'Update processed_videos manifest'], check=False)
+subprocess.run(['git', '-C', script_dir, 'push'], check=False)
