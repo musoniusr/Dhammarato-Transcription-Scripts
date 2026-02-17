@@ -107,7 +107,36 @@ A typical video takes 5–15 minutes to process (most of that is transcription t
 
 ---
 
-## 6. Collaborative workflow
+## 6. How to add videos to process
+
+Videos are added to `list_of_videos.txt` using `yt-dlp` to fetch video info directly
+from the YouTube channel. You do not need to copy URLs manually.
+
+### Fetch the most recent 10 videos
+
+```
+yt-dlp --flat-playlist --playlist-end 10 --print "%(upload_date)s | %(title)s | %(url)s" "https://www.youtube.com/@DhammaratoDhamma/videos" > latest_10_videos.txt
+```
+
+### Fetch a specific range of videos
+
+Replace `101` and `200` with the range you want (based on upload order, newest first):
+
+```
+yt-dlp --flat-playlist --playlist-start 101 --playlist-end 200 --print "%(upload_date)s | %(title)s | %(url)s" "https://www.youtube.com/@DhammaratoDhamma/videos" > 101_200_videos.txt
+```
+
+### Add them to the input file
+
+Open the output `.txt` file, copy all the lines, and paste them into `list_of_videos.txt`.
+The script understands the `date | title | url` format automatically — no editing needed.
+
+> Note: Videos already in `processed_videos.csv` will be skipped automatically, so it is
+> safe to paste in lines that overlap with what has already been processed.
+
+---
+
+## 7. Collaborative workflow
 
 The script handles synchronization automatically:
 
@@ -129,7 +158,7 @@ If you are unsure what to do, reach out on the project Discord or open a GitHub 
 
 ---
 
-## 7. What the output files are
+## 8. What the output files are
 
 | File | Description |
 |---|---|
